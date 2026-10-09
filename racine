@@ -1,1 +1,1746 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+# ═══════════════════════════════════════════════════════════════════════════
+# HYPERION PERPLEXITY ENGINE v1.0.0
+# Moteur type Perplexity : question -> réponse citée + 1M sources
+# ─────────────────────────────────────────────────────────────────────────
+# Auteur : Aissa Mohammedi (DGK)
+# Licence : NEXUS-OPEN-2.0
+# Port : 8091
+# ─────────────────────────────────────────────────────────────────────────
+# Zero dépendance · stdlib pure · a-Shell / Linux / macOS / Windows
+# ═══════════════════════════════════════════════════════════════════════════
 
+import os
+import re
+import sys
+import gzip
+import json
+import time
+import math
+import ssl
+import html
+import uuid
+import socket
+import sqlite3
+import hashlib
+import datetime
+import threading
+import urllib.request
+import urllib.parse
+import urllib.error
+import urllib.robotparser
+from collections import OrderedDict, defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from html.parser import HTMLParser
+
+VERSION = "1.0.0"
+AUTEUR = "Aissa Mohammedi (DGK)"
+LICENCE = "NEXUS-OPEN-2.0"
+
+HOME = os.path.expanduser("~")
+BASE = os.path.join(HOME, "Documents", "hyperion_perplexity")
+CACHE_DIR = os.path.join(BASE, "cache")
+LOGS_DIR = os.path.join(BASE, "logs")
+CONFIG_DIR = os.path.join(BASE, "config")
+DOCS_DIR = os.path.join(BASE, "docs")
+DB_FILE = os.path.join(BASE, "index.db")
+LOG_FILE = os.path.join(LOGS_DIR, "engine.log")
+CRAWLER_LOG = os.path.join(LOGS_DIR, "crawler.log")
+README_FILE = os.path.join(BASE, "README.md")
+LICENSE_FILE = os.path.join(BASE, "LICENSE")
+CHANGELOG_FILE = os.path.join(BASE, "CHANGELOG.md")
+
+for d in (BASE, CACHE_DIR, LOGS_DIR, CONFIG_DIR, DOCS_DIR):
+try:
+os.makedirs(d, exist_ok=True)
+except OSError:
+pass
+
+PORT = int(os.environ.get("PORT", 8091))
+HOST = "0.0.0.0"
+
+SSL_CTX = ssl.create_default_context()
+SSL_CTX.check_hostname = False
+SSL_CTX.verify_mode = ssl.CERT_NONE
+
+UA = "Mozilla/5.0 (compatible; HyperionPerplexity/1.0)"
+
+GIT = {
+"repo": "https://github.com/aissa-mohammedi/hyperion-perplexity",
+"issues": "https://github.com/aissa-mohammedi/hyperion-perplexity/issues",
+"wiki": "https://github.com/aissa-mohammedi/hyperion-perplexity/wiki",
+"releases": "https://github.com/aissa-mohammedi/hyperion-perplexity/releases",
+}
+
+CACHE = OrderedDict()
+CACHE_LOCK = threading.RLock()
+CACHE_MAX = 20000
+CACHE_TTL = 900
+
+STOPWORDS = {
+"the", "a", "an", "and", "or", "but", "of", "to", "in", "on", "at",
+"by", "with", "for", "is", "are", "was", "were", "be", "been", "have",
+"has", "had", "do", "does", "did", "will", "would", "could", "should",
+"le", "la", "les", "un", "une", "des", "du", "de", "et", "ou", "mais",
+"que", "qui", "quoi", "dans", "sur", "sous", "avec", "sans", "pour",
+}
+
+_word_rx = re.compile(r"[a-zA-Zà-ÿ0-9_\-]{3,30}", re.UNICODE)
+
+LOG_LOCK = threading.RLock()
+
+
+def log(msg, to_file=None):
+ts = time.strftime("%Y-%m-%d %H:%M:%S")
+try:
+safe = str(msg).encode("ascii", "ignore").decode("ascii")
+except Exception:
+safe = str(msg)
+line = "[{}] {}".format(ts, safe)
+try:
+print(line, flush=True)
+except Exception:
+pass
+target = to_file or LOG_FILE
+with LOG_LOCK:
+try:
+with open(target, "a", encoding="utf-8") as f:
+f.write(line + "\n")
+except OSError:
+pass
+
+
+def clog(msg):
+log(msg, to_file=CRAWLER_LOG)
+
+
+def tokenize(text):
+if not text:
+return []
+words = _word_rx.findall(text.lower())
+return [w.strip("'-") for w in words if w not in STOPWORDS]
+
+
+def strip_html(s):
+if not s:
+return ""
+s = re.sub(r"<[^>]+>", " ", s)
+s = html.unescape(s)
+s = re.sub(r"\s+", " ", s)
+return s.strip()
+
+
+def simhash(text, bits=64):
+if not text:
+return 0
+tokens = tokenize(text)
+if not tokens:
+return 0
+v = [0] * bits
+for tok in tokens:
+h = int(hashlib.md5(tok.encode("utf-8", "ignore")).hexdigest()[:16], 16)
+for i in range(bits):
+v[i] += 1 if (h & (1 << i)) else -1
+out = 0
+for i in range(bits):
+if v[i] > 0:
+out |= (1 << i)
+return out
+
+
+def hamming(a, b):
+return bin(a ^ b).count("1")
+
+
+def http_get(url, timeout=10, headers=None, max_size=3_000_000):
+h = {"User-Agent": UA, "Accept": "*/*", "Accept-Encoding": "gzip"}
+if headers:
+h.update(headers)
+try:
+req = urllib.request.Request(url, headers=h)
+t0 = time.time()
+with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+raw = r.read(max_size)
+if r.headers.get("Content-Encoding", "").lower() == "gzip":
+try:
+raw = gzip.decompress(raw)
+except Exception:
+pass
+return {
+"ok": True,
+"body": raw.decode("utf-8", "ignore"),
+"status": r.status,
+"ms": round((time.time() - t0) * 1000),
+}
+except urllib.error.HTTPError as e:
+return {"ok": False, "err": "HTTP " + str(e.code), "status": e.code}
+except Exception as e:
+return {"ok": False, "err": str(e)[:120], "status": 0}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 1 · 200 SOURCES D'AMORCAGE
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Chaque source = seed (URL de départ) ou API (endpoint de transit)
+SEED_DOMAINS = [
+# Encyclopédies et références
+"https://fr.wikipedia.org",
+"https://en.wikipedia.org",
+"https://www.britannica.com",
+"https://plato.stanford.edu",
+"https://www.wikidata.org",
+"https://www.wiktionary.org",
+"https://www.wikisource.org",
+
+# Code
+"https://github.com",
+"https://gitlab.com",
+"https://bitbucket.org",
+"https://sourceforge.net",
+"https://stackoverflow.com",
+"https://dev.to",
+"https://medium.com",
+"https://news.ycombinator.com",
+"https://lobste.rs",
+"https://reddit.com",
+
+# Sciences
+"https://arxiv.org",
+"https://www.nature.com",
+"https://science.sciencemag.org",
+"https://pubmed.ncbi.nlm.nih.gov",
+"https://www.semanticscholar.org",
+"https://www.researchgate.net",
+"https://www.biorxiv.org",
+"https://www.medrxiv.org",
+"https://openalex.org",
+"https://crossref.org",
+"https://zenodo.org",
+"https://osf.io",
+
+# Tech news
+"https://techcrunch.com",
+"https://www.theverge.com",
+"https://arstechnica.com",
+"https://www.wired.com",
+"https://www.technologyreview.com",
+"https://thenextweb.com",
+"https://venturebeat.com",
+"https://www.zdnet.com",
+"https://www.cnet.com",
+
+# Documentation
+"https://developer.mozilla.org",
+"https://docs.python.org",
+"https://nodejs.org",
+"https://go.dev",
+"https://doc.rust-lang.org",
+"https://www.php.net",
+"https://www.ruby-lang.org",
+"https://kubernetes.io",
+"https://docker.com",
+"https://aws.amazon.com",
+"https://cloud.google.com",
+"https://azure.microsoft.com",
+
+# Bibliothèques / paquets
+"https://pypi.org",
+"https://www.npmjs.com",
+"https://crates.io",
+"https://rubygems.org",
+"https://packagist.org",
+"https://nuget.org",
+"https://maven.apache.org",
+
+# Presse générale
+"https://www.lemonde.fr",
+"https://www.lefigaro.fr",
+"https://www.liberation.fr",
+"https://www.nytimes.com",
+"https://www.bbc.com",
+"https://www.theguardian.com",
+"https://www.reuters.com",
+"https://www.bloomberg.com",
+"https://www.wsj.com",
+"https://www.economist.com",
+"https://www.aljazeera.com",
+"https://www.france24.com",
+"https://www.rfi.fr",
+
+# Institutions
+"https://www.un.org",
+"https://www.who.int",
+"https://www.worldbank.org",
+"https://www.imf.org",
+"https://ec.europa.eu",
+"https://www.whitehouse.gov",
+"https://www.elysee.fr",
+"https://www.gov.uk",
+"https://www.gouvernement.fr",
+"https://www.insee.fr",
+"https://www.nist.gov",
+"https://www.cisa.gov",
+"https://www.cve.org",
+
+# Archives
+"https://web.archive.org",
+"https://archive.org",
+"https://archive.ph",
+"https://commoncrawl.org",
+"https://www.softwareheritage.org",
+
+# Actualités IA / ML
+"https://huggingface.co",
+"https://paperswithcode.com",
+"https://openai.com",
+"https://www.anthropic.com",
+"https://deepmind.google",
+"https://ai.meta.com",
+
+# Éducation
+"https://ocw.mit.edu",
+"https://www.coursera.org",
+"https://www.edx.org",
+"https://www.khanacademy.org",
+"https://www.openclassrooms.com",
+"https://www.fun-mooc.fr",
+
+# Blogs tech
+"https://blog.cloudflare.com",
+"https://netflixtechblog.com",
+"https://engineering.fb.com",
+"https://developers.googleblog.com",
+"https://aws.amazon.com/blogs",
+"https://www.troyhunt.com",
+"https://blog.jetbrains.com",
+
+# Newsletters / curation
+"https://www.producthunt.com",
+"https://betalist.com",
+"https://www.indiehackers.com",
+"https://news.ycombinator.com/newest",
+
+# Réseaux / social
+"https://mastodon.social",
+"https://bsky.app",
+"https://www.linkedin.com",
+"https://twitter.com",
+"https://x.com",
+
+# Vidéos
+"https://www.youtube.com",
+"https://vimeo.com",
+"https://www.dailymotion.com",
+"https://www.twitch.tv",
+
+# Questions / réponses
+"https://www.quora.com",
+"https://superuser.com",
+"https://serverfault.com",
+"https://askubuntu.com",
+"https://mathoverflow.net",
+"https://physics.stackexchange.com",
+"https://biology.stackexchange.com",
+
+# Commerce
+"https://www.amazon.com",
+"https://www.ebay.com",
+"https://www.aliexpress.com",
+"https://www.etsy.com",
+"https://www.alibaba.com",
+
+# Finance
+"https://finance.yahoo.com",
+"https://www.marketwatch.com",
+"https://www.coingecko.com",
+"https://coinmarketcap.com",
+"https://www.tradingview.com",
+
+# Météo / données
+"https://open-meteo.com",
+"https://www.worldweatheronline.com",
+"https://earth.nullschool.net",
+
+# Géographie
+"https://www.openstreetmap.org",
+"https://restcountries.com",
+"https://www.geonames.org",
+
+# Santé
+"https://www.doctissimo.fr",
+"https://www.passeportsante.net",
+"https://www.vidal.fr",
+"https://www.has-sante.fr",
+
+# Droit
+"https://www.legifrance.gouv.fr",
+"https://eur-lex.europa.eu",
+"https://www.courdecassation.fr",
+"https://www.conseil-etat.fr",
+
+# Culture
+"https://www.imdb.com",
+"https://www.allocine.fr",
+"https://www.senscritique.com",
+"https://www.bnf.fr",
+"https://www.loc.gov",
+
+# Musique
+"https://www.discogs.com",
+"https://musicbrainz.org",
+"https://www.last.fm",
+"https://soundcloud.com",
+
+# Livres
+"https://www.goodreads.com",
+"https://www.babelio.com",
+"https://openlibrary.org",
+"https://www.gutenberg.org",
+
+# Géo / carto
+"https://www.ign.fr",
+"https://www.geoportail.gouv.fr",
+"https://www.mapbox.com",
+
+# Emploi
+"https://www.indeed.com",
+"https://www.linkedin.com/jobs",
+"https://www.glassdoor.com",
+"https://www.welcometothejungle.com",
+
+# Événements
+"https://www.eventbrite.com",
+"https://www.meetup.com",
+"https://lu.ma",
+]
+
+# APIs de transit (gratuites ou avec clé)
+TRANSIT_APIS = {
+"duckduckgo_ia": {
+"url": "https://api.duckduckgo.com/?q={q}&format=json&no_html=1",
+"auth": [],
+},
+"wikipedia": {
+"url": "https://fr.wikipedia.org/api/rest_v1/page/summary/{q}",
+"auth": [],
+},
+"github": {
+"url": "https://api.github.com/search/repositories?q={q}&per_page=5",
+"auth": [],
+},
+"hn": {
+"url": "https://hn.algolia.com/api/v1/search?query={q}&hitsPerPage=5",
+"auth": [],
+},
+"stackoverflow": {
+"url": "https://api.stackexchange.com/2.3/search/advanced?order=desc&sort=relevance&q={q}&site=stackoverflow&pagesize=5",
+"auth": [],
+},
+"arxiv": {
+"url": "http://export.arxiv.org/api/query?search_query=all:{q}&max_results=3",
+"auth": [],
+},
+"crossref": {
+"url": "https://api.crossref.org/works?query={q}&rows=5",
+"auth": [],
+},
+"openalex": {
+"url": "https://api.openalex.org/works?search={q}&per-page=5",
+"auth": [],
+},
+"pubmed": {
+"url": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term={q}&retmode=json&retmax=5",
+"auth": [],
+},
+"npm": {
+"url": "https://registry.npmjs.org/-/v1/search?text={q}&size=5",
+"auth": [],
+},
+"pypi": {
+"url": "https://pypi.org/pypi/{q}/json",
+"auth": [],
+},
+"mdn": {
+"url": "https://developer.mozilla.org/api/v1/search?q={q}&locale=en-US",
+"auth": [],
+},
+"coingecko": {
+"url": "https://api.coingecko.com/api/v3/search?query={q}",
+"auth": [],
+},
+"restcountries": {
+"url": "https://restcountries.com/v3.1/name/{q}",
+"auth": [],
+},
+"openmeteo": {
+"url": "https://api.open-meteo.com/v1/forecast?latitude=48.85&longitude=2.35&current_weather=true",
+"auth": [],
+},
+"huggingface": {
+"url": "https://huggingface.co/api/models?search={q}&limit=8",
+"auth": [],
+},
+"semanticscholar": {
+"url": "https://api.semanticscholar.org/graph/v1/paper/search?query={q}&limit=5",
+"auth": [],
+},
+"worldbank": {
+"url": "https://api.worldbank.org/v2/country/all/indicator/NY.GDP.MKTP.CD?format=json&per_page=5",
+"auth": [],
+},
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 2 · INDEX LOCAL
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PerplexityIndex:
+def __init__(self, path=DB_FILE):
+self.path = str(path)
+self.local = threading.local()
+self.lock = threading.RLock()
+self._init()
+
+def _conn(self):
+if not hasattr(self.local, "conn"):
+conn = sqlite3.connect(self.path, timeout=60,
+check_same_thread=False, isolation_level=None)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA synchronous=NORMAL")
+conn.execute("PRAGMA cache_size=-128000")
+conn.execute("PRAGMA temp_store=MEMORY")
+conn.execute("PRAGMA mmap_size=268435456")
+self.local.conn = conn
+return self.local.conn
+
+def _init(self):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"CREATE TABLE IF NOT EXISTS sources ("
+"id INTEGER PRIMARY KEY AUTOINCREMENT,"
+"url TEXT UNIQUE,domain TEXT,title TEXT,snippet TEXT,"
+"content TEXT,source TEXT,score INTEGER,simhash INTEGER,"
+"added_at REAL)"
+)
+cur.execute("CREATE INDEX IF NOT EXISTS idx_url ON sources(url)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_domain ON sources(domain)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_sh ON sources(simhash)")
+cur.execute(
+"CREATE TABLE IF NOT EXISTS terms ("
+"term TEXT,src_id INTEGER,freq INTEGER,"
+"PRIMARY KEY (term, src_id))"
+)
+cur.execute("CREATE INDEX IF NOT EXISTS idx_term ON terms(term)")
+cur.execute("CREATE INDEX IF NOT EXISTS idx_src ON terms(src_id)")
+cur.execute(
+"CREATE TABLE IF NOT EXISTS queue ("
+"url TEXT PRIMARY KEY,priority INTEGER,added_at REAL,visited INTEGER DEFAULT 0)"
+)
+cur.execute("CREATE INDEX IF NOT EXISTS idx_q ON queue(visited, priority)")
+cur.execute(
+"CREATE TABLE IF NOT EXISTS stats (key TEXT PRIMARY KEY, value REAL)"
+)
+for k in ("total_sources", "total_terms", "total_queue"):
+cur.execute("INSERT OR IGNORE INTO stats (key,value) VALUES (?,0)", (k,))
+conn.commit()
+
+def add_source(self, url, domain, title, snippet, content, source, score):
+if not url:
+return None
+sh = simhash((title or "") + " " + (snippet or ""))
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+try:
+cur.execute(
+"INSERT OR IGNORE INTO sources "
+"(url,domain,title,snippet,content,source,score,simhash,added_at) "
+"VALUES (?,?,?,?,?,?,?,?,?)",
+(url, domain, (title or "")[:500], (snippet or "")[:1000],
+(content or "")[:50000], source, score, sh, time.time())
+)
+if cur.rowcount == 0:
+cur.execute("SELECT id FROM sources WHERE url = ?", (url,))
+r = cur.fetchone()
+return r[0] if r else None
+sid = cur.lastrowid
+words = tokenize((title or "") + " " + (content or "")[:20000])
+freq = Counter(words)
+if freq:
+cur.executemany(
+"INSERT OR REPLACE INTO terms (term,src_id,freq) VALUES (?,?,?)",
+[(w, sid, n) for w, n in freq.items()]
+)
+return sid
+except Exception as e:
+log("add_source err " + str(e)[:100])
+return None
+
+def search(self, query, limit=50):
+words = tokenize(query)
+if not words:
+return []
+ph = ",".join("?" * len(words))
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"SELECT src_id, SUM(freq) AS s FROM terms WHERE term IN (" +
+ph + ") GROUP BY src_id ORDER BY s DESC LIMIT ?",
+words + [limit]
+)
+ids = [r[0] for r in cur.fetchall()]
+if not ids:
+return []
+ph2 = ",".join("?" * len(ids))
+cur.execute(
+"SELECT id,url,domain,title,snippet,source,score FROM sources "
+"WHERE id IN (" + ph2 + ")",
+ids
+)
+out = []
+for r in cur.fetchall():
+out.append({
+"id": r[0], "url": r[1], "domain": r[2],
+"title": r[3], "snippet": r[4],
+"source": r[5], "score": r[6] or 50,
+"score_final": (r[6] or 50) + 20,
+})
+return out
+
+def stats(self):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM sources")
+s = cur.fetchone()[0] or 0
+cur.execute("SELECT COUNT(*) FROM terms")
+t = cur.fetchone()[0] or 0
+cur.execute("SELECT COUNT(*) FROM queue WHERE visited = 0")
+q = cur.fetchone()[0] or 0
+return {"sources": s, "terms": t, "queue": q}
+
+def recent(self, limit=10):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"SELECT url,title,domain,added_at FROM sources "
+"ORDER BY id DESC LIMIT ?", (limit,)
+)
+return [{"url": r[0], "title": r[1], "domain": r[2], "ts": r[3]}
+for r in cur.fetchall()]
+
+# ─── Queue ───
+def queue_add(self, url, priority=5):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+try:
+cur.execute(
+"INSERT OR IGNORE INTO queue (url,priority,added_at,visited) "
+"VALUES (?,?,?,0)", (url, priority, time.time()))
+conn.commit()
+return cur.rowcount > 0
+except Exception:
+return False
+
+def queue_next(self, n=64):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute(
+"SELECT url FROM queue WHERE visited = 0 "
+"ORDER BY priority ASC, added_at ASC LIMIT ?", (n,)
+)
+rows = [r[0] for r in cur.fetchall()]
+if rows:
+ph = ",".join("?" * len(rows))
+cur.execute("UPDATE queue SET visited = 1 WHERE url IN (" + ph + ")", rows)
+conn.commit()
+return rows
+
+def queue_size(self):
+with self.lock:
+conn = self._conn()
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM queue WHERE visited = 0")
+return cur.fetchone()[0] or 0
+
+
+IDX = PerplexityIndex()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 3 · HTML PARSER (extraction liens + texte)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HTMLExtractor(HTMLParser):
+def __init__(self, base_url=""):
+super().__init__()
+self.base_url = base_url
+self.title = ""
+self.description = ""
+self.text_parts = []
+self.links = []
+self._in_title = False
+self._in_script = False
+self._in_style = False
+self._in_head = False
+
+def handle_starttag(self, tag, attrs):
+a = dict(attrs)
+tag = tag.lower()
+if tag == "title":
+self._in_title = True
+elif tag == "script":
+self._in_script = True
+elif tag == "style":
+self._in_style = True
+elif tag == "head":
+self._in_head = True
+elif tag == "meta":
+n = (a.get("name") or "").lower()
+p = (a.get("property") or "").lower()
+c = a.get("content", "")
+if n == "description" or p == "og:description":
+self.description = c[:500]
+elif p == "og:title" and not self.title:
+self.title = c[:200]
+elif tag == "a":
+href = a.get("href", "")
+if href and not href.startswith(("javascript:", "mailto:", "#")):
+self.links.append(urllib.parse.urljoin(self.base_url, href))
+
+def handle_endtag(self, tag):
+t = tag.lower()
+if t == "title":
+self._in_title = False
+elif t == "script":
+self._in_script = False
+elif t == "style":
+self._in_style = False
+elif t == "head":
+self._in_head = False
+
+def handle_data(self, data):
+if self._in_script or self._in_style:
+return
+if self._in_title:
+self.title += data
+elif not self._in_head:
+s = data.strip()
+if s:
+self.text_parts.append(s)
+
+def result(self):
+return {
+"title": self.title.strip()[:300],
+"description": self.description.strip(),
+"text": " ".join(self.text_parts)[:200000],
+"links": self.links[:200],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 4 · CRAWLER MASSIF (1M sources target)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class MassCrawler:
+def __init__(self, num_workers=32):
+self.num_workers = num_workers
+self.running = False
+self.workers = []
+self.lock = threading.RLock()
+self.stats = {
+"pages_fetched": 0, "pages_indexed": 0, "pages_failed": 0,
+"pages_duplicate": 0, "links_found": 0, "started_at": None,
+"rate_per_min": 0, "last_page": "", "current_workers": 0,
+}
+self.robots = {}
+self.robots_lock = threading.RLock()
+self.domain_last = defaultdict(float)
+self.domain_lock = threading.RLock()
+self.seen_sh = {}
+self.sh_lock = threading.RLock()
+
+def can_fetch(self, url):
+try:
+p = urllib.parse.urlparse(url)
+dom = p.netloc
+with self.robots_lock:
+if dom in self.robots:
+rp = self.robots[dom]
+else:
+rp = urllib.robotparser.RobotFileParser()
+rp.set_url(p.scheme + "://" + dom + "/robots.txt")
+try:
+rp.read()
+except Exception:
+rp = None
+self.robots[dom] = rp
+if rp is None:
+return True
+return rp.can_fetch(UA, url)
+except Exception:
+return True
+
+def rate_limit(self, url):
+try:
+dom = urllib.parse.urlparse(url).netloc
+with self.domain_lock:
+now = time.time()
+last = self.domain_last.get(dom, 0)
+wait = 0.15 - (now - last)
+if wait > 0:
+time.sleep(min(wait, 1.0))
+self.domain_last[dom] = time.time()
+except Exception:
+pass
+
+def is_dup(self, sh):
+with self.sh_lock:
+for known_sh in self.seen_sh:
+if hamming(sh, known_sh) <= 3:
+return True
+self.seen_sh[sh] = time.time()
+if len(self.seen_sh) > 200000:
+items = sorted(self.seen_sh.items(), key=lambda x: x[1])
+self.seen_sh = dict(items[-150000:])
+return False
+
+def fetch(self, url, timeout=8):
+self.rate_limit(url)
+try:
+req = urllib.request.Request(url, headers={
+"User-Agent": UA,
+"Accept": "text/html,application/xhtml+xml",
+"Accept-Encoding": "gzip",
+})
+with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
+ct = r.headers.get("Content-Type", "").lower()
+if "text/html" not in ct and "application/xhtml" not in ct:
+return None
+raw = r.read(1_500_000)
+if r.headers.get("Content-Encoding", "").lower() == "gzip":
+try:
+raw = gzip.decompress(raw)
+except Exception:
+pass
+return raw.decode("utf-8", "ignore")
+except Exception:
+return None
+
+def index_url(self, url):
+if not url or not url.startswith(("http://", "https://")):
+return None
+if not self.can_fetch(url):
+return None
+
+html_txt = self.fetch(url)
+if not html_txt:
+with self.lock:
+self.stats["pages_failed"] += 1
+return None
+
+try:
+parser = HTMLExtractor(base_url=url)
+parser.feed(html_txt)
+data = parser.result()
+except Exception:
+with self.lock:
+self.stats["pages_failed"] += 1
+return None
+
+title = data["title"] or url
+description = data["description"]
+content = data["text"]
+if len(content) < 200:
+with self.lock:
+self.stats["pages_failed"] += 1
+return None
+
+sh = simhash(title + " " + content[:3000])
+if self.is_dup(sh):
+with self.lock:
+self.stats["pages_duplicate"] += 1
+return None
+
+domain = urllib.parse.urlparse(url).netloc
+sid = IDX.add_source(url, domain, title, description, content, "CRAWL", 60)
+if not sid:
+return None
+
+with self.lock:
+self.stats["pages_fetched"] += 1
+self.stats["pages_indexed"] += 1
+self.stats["links_found"] += len(data["links"])
+self.stats["last_page"] = url
+
+for link in data["links"]:
+if not link.startswith(("http://", "https://")):
+continue
+# Filtre extensions binaires
+ext = os.path.splitext(urllib.parse.urlparse(link).path)[1].lower()
+if ext in (".pdf", ".zip", ".rar", ".tar", ".gz", ".exe", ".mp4",
+".mp3", ".jpg", ".jpeg", ".png", ".gif", ".webp",
+".svg", ".ico", ".css", ".js", ".woff", ".woff2",
+".ttf", ".eot"):
+continue
+link_dom = urllib.parse.urlparse(link).netloc
+prio = 3 if link_dom == domain else 7
+IDX.queue_add(link, priority=prio)
+
+return {"url": url, "title": title[:80], "sid": sid}
+
+def worker_loop(self, wid):
+while self.running:
+batch = IDX.queue_next(8)
+if not batch:
+time.sleep(0.3)
+continue
+for url in batch:
+if not self.running:
+return
+try:
+r = self.index_url(url)
+if r:
+clog("[W{}] {}".format(wid, r["url"][:100]))
+except Exception as e:
+clog("[W{}] err {}".format(wid, str(e)[:100]))
+
+def start(self, num_workers=None):
+if self.running:
+return False
+if num_workers:
+self.num_workers = num_workers
+self.running = True
+self.stats["started_at"] = time.time()
+for i in range(self.num_workers):
+t = threading.Thread(target=self.worker_loop, args=(i,), daemon=True)
+t.start()
+self.workers.append(t)
+self.stats["current_workers"] = len(self.workers)
+clog("Crawler demarre : {} workers".format(self.num_workers))
+return True
+
+def stop(self):
+self.running = False
+clog("Crawler arrete")
+
+def status(self):
+with self.lock:
+s = dict(self.stats)
+elapsed = time.time() - s["started_at"] if s["started_at"] else 0
+if elapsed > 0:
+s["rate_per_min"] = round(s["pages_indexed"] / elapsed * 60, 1)
+s["elapsed_s"] = round(elapsed, 1)
+s["running"] = self.running
+s["workers"] = self.num_workers
+s["queue"] = IDX.queue_size()
+return s
+
+
+CRAWLER = MassCrawler(num_workers=32)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 5 · SEEDING (200 domaines + APIs)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def seed_all(limit_per_domain=5):
+"""Ajoute les domaines seeds + quelques URLs internes à la queue."""
+n = 0
+for domain in SEED_DOMAINS:
+if IDX.queue_add(domain, priority=1):
+n += 1
+return n
+
+
+def seed_wikipedia_random(count=1000):
+"""Ajoute N pages Wikipedia aleatoires."""
+import random
+topics = [
+"Python_(langage)", "JavaScript", "Rust_(langage)", "Go_(langage)",
+"Linux", "Unix", "Windows", "macOS", "Android", "iOS",
+"Intelligence_artificielle", "Machine_learning", "Apprentissage_profond",
+"Internet", "World_Wide_Web", "HTTP", "HTTPS", "DNS", "TCP",
+"Cryptographie", "Chiffrement", "Base_de_donnees", "SQL", "NoSQL",
+"Blockchain", "Bitcoin", "Ethereum", "Cloud_computing", "Docker",
+"Kubernetes", "Git", "GitHub", "GitLab", "Compilateur", "Interpreteur",
+"Algorithme", "Structure_de_donnees", "Complexite_algorithmique",
+"Reseau_de_neurones_artificiels", "Traitement_du_langage_naturel",
+"Vision_par_ordinateur", "Robotique", "Informatique_quantique",
+]
+n = 0
+for _ in range(count):
+topic = random.choice(topics)
+url = "https://fr.wikipedia.org/wiki/" + topic
+if IDX.queue_add(url, priority=1):
+n += 1
+return n
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 6 · PERPLEXITY-STYLE ANSWER
+# ═══════════════════════════════════════════════════════════════════════════
+
+def generate_answer(query, sources):
+"""Génère une réponse type Perplexity : synthèse + citations."""
+if not sources:
+return {"answer": "Aucune source trouvée pour cette requête.",
+"citations": []}
+
+# Extraction des phrases clés des top sources
+sentences = []
+for i, src in enumerate(sources[:10], 1):
+snippet = src.get("snippet") or ""
+if len(snippet) < 50:
+continue
+# Nettoyage
+snippet = re.sub(r"\s+", " ", snippet).strip()
+sentences.append({
+"text": snippet[:400],
+"source_id": i,
+"url": src.get("url", ""),
+"title": src.get("title", ""),
+"domain": src.get("domain", ""),
+})
+
+# Construction de la réponse
+answer_parts = []
+answer_parts.append("Voici une synthèse basée sur " + str(len(sentences)) + " sources :\n")
+
+for i, s in enumerate(sentences[:8], 1):
+answer_parts.append("{}. {} [{}]".format(i, s["text"], s["source_id"]))
+
+answer_text = "\n".join(answer_parts)
+
+citations = [
+{
+"id": s["source_id"],
+"url": s["url"],
+"title": s["title"],
+"domain": s["domain"],
+}
+for s in sentences
+]
+
+return {
+"answer": answer_text,
+"citations": citations,
+"nb_sources": len(sentences),
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 7 · SEARCH PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def search(query, limit=30):
+if not query or not query.strip():
+return {"query": query, "results": [], "count": 0, "sources": []}
+
+ck = ("p1", query.lower(), limit)
+with CACHE_LOCK:
+if ck in CACHE:
+ts, data = CACHE[ck]
+if time.time() - ts < CACHE_TTL:
+CACHE.move_to_end(ck)
+cached = dict(data)
+cached["cached"] = True
+return cached
+
+t0 = time.time()
+log("SEARCH : " + query)
+
+# 1) Index local
+internal = IDX.search(query, limit=limit)
+
+# 2) APIs de transit en parallèle
+external = []
+with ThreadPoolExecutor(max_workers=16) as ex:
+futures = {}
+for name, cfg in TRANSIT_APIS.items():
+if cfg["auth"] and not all(os.environ.get(k) for k in cfg["auth"]):
+continue
+url = cfg["url"].replace("{q}", urllib.parse.quote(query))
+futures[ex.submit(http_get, url, 8)] = name
+for fut in as_completed(futures, timeout=15):
+name = futures[fut]
+try:
+r = fut.result(timeout=10)
+if not r.get("ok"):
+continue
+res = parse_transit(name, r["body"])
+if res:
+external.extend(res)
+except Exception:
+pass
+
+# 3) Dédup + ranking
+all_res = internal + external
+seen = set()
+ranked = []
+words = set(re.findall(r"\w+", query.lower()))
+for r in all_res:
+url = (r.get("url") or "").strip()
+if not url or url in seen:
+continue
+seen.add(url)
+score = r.get("score", 50)
+title_low = (r.get("title") or "").lower()
+snippet_low = (r.get("snippet") or "").lower()
+for w in words:
+if w in title_low:
+score += 8
+if w in snippet_low:
+score += 3
+r["score_final"] = score
+ranked.append(r)
+ranked.sort(key=lambda x: -x["score_final"])
+
+# 4) Async re-index
+def _idx(results):
+for r in results[:20]:
+domain = urllib.parse.urlparse(r.get("url", "")).netloc
+IDX.add_source(r.get("url"), domain, r.get("title"),
+r.get("snippet"), "", r.get("source", "EXT"), r.get("score", 50))
+threading.Thread(target=_idx, args=(external,), daemon=True).start()
+
+# 5) Réponse type Perplexity
+answer = generate_answer(query, ranked)
+
+duration_ms = round((time.time() - t0) * 1000, 2)
+result = {
+"query": query,
+"timestamp": datetime.datetime.now().isoformat(),
+"count": len(ranked),
+"sources": sorted(set(r.get("source", "") for r in ranked if r.get("source"))),
+"duration_ms": duration_ms,
+"internal_matches": len(internal),
+"external_matches": len(external),
+"cached": False,
+"answer": answer,
+"results": ranked[:limit],
+}
+with CACHE_LOCK:
+CACHE[ck] = (time.time(), result)
+while len(CACHE) > CACHE_MAX:
+CACHE.popitem(last=False)
+log("DONE {} results in {}ms".format(len(ranked), duration_ms))
+return result
+
+
+def parse_transit(name, body):
+"""Parse une réponse d'API de transit."""
+out = []
+try:
+if name == "duckduckgo_ia":
+data = json.loads(body)
+if data.get("AbstractText"):
+out.append({
+"title": data.get("Heading", ""),
+"snippet": data["AbstractText"][:500],
+"url": data.get("AbstractURL", ""),
+"source": "DuckDuckGo",
+"score": 90,
+})
+for t in data.get("RelatedTopics", [])[:8]:
+if isinstance(t, dict) and "Text" in t:
+out.append({
+"title": strip_html(t.get("Text", ""))[:120],
+"snippet": strip_html(t.get("Text", ""))[:400],
+"url": t.get("FirstURL", ""),
+"source": "DuckDuckGo",
+"score": 60,
+})
+elif name == "wikipedia":
+data = json.loads(body)
+if "extract" in data:
+out.append({
+"title": data.get("title", ""),
+"snippet": data.get("extract", "")[:600],
+"url": data.get("content_urls", {}).get("desktop", {}).get("page", ""),
+"source": "Wikipedia",
+"score": 95,
+})
+elif name == "github":
+data = json.loads(body)
+for i in data.get("items", [])[:5]:
+out.append({
+"title": i.get("full_name", ""),
+"snippet": (i.get("description") or "")[:200],
+"url": i.get("html_url", ""),
+"source": "GitHub",
+"score": 75,
+})
+elif name == "hn":
+data = json.loads(body)
+for h in data.get("hits", [])[:5]:
+out.append({
+"title": h.get("title") or h.get("story_title") or "",
+"snippet": "HN · {} pts".format(h.get("points", 0)),
+"url": h.get("url") or ("https://news.ycombinator.com/item?id=" + str(h.get("objectID", ""))),
+"source": "HackerNews",
+"score": 70,
+})
+elif name == "stackoverflow":
+data = json.loads(body)
+for i in data.get("items", [])[:5]:
+out.append({
+"title": i.get("title", ""),
+"snippet": "Score {} · Rep {}".format(i.get("score", 0), i.get("answer_count", 0)),
+"url": i.get("link", ""),
+"source": "StackOverflow",
+"score": 70,
+})
+elif name == "arxiv":
+for e in re.findall(r"<entry>(.*?)</entry>", body, re.DOTALL)[:3]:
+t = re.search(r"<title>(.*?)</title>", e, re.DOTALL)
+s = re.search(r"<summary>(.*?)</summary>", e, re.DOTALL)
+l = re.search(r"<id>(.*?)</id>", e, re.DOTALL)
+if t and s:
+out.append({
+"title": t.group(1).strip()[:150],
+"snippet": s.group(1).strip()[:300],
+"url": l.group(1).strip() if l else "",
+"source": "ArXiv",
+"score": 80,
+})
+elif name == "crossref":
+data = json.loads(body)
+for item in data.get("message", {}).get("items", [])[:5]:
+out.append({
+"title": (item.get("title") or [""])[0][:200],
+"snippet": (item.get("abstract") or "")[:300],
+"url": item.get("URL", ""),
+"source": "Crossref",
+"score": 75,
+})
+elif name == "openalex":
+data = json.loads(body)
+for item in data.get("results", [])[:5]:
+out.append({
+"title": item.get("title", ""),
+"snippet": "Citations {}".format(item.get("cited_by_count", 0)),
+"url": item.get("doi", ""),
+"source": "OpenAlex",
+"score": 75,
+})
+elif name == "pubmed":
+data = json.loads(body)
+for pid in data.get("esearchresult", {}).get("idlist", [])[:5]:
+out.append({
+"title": "PubMed " + pid,
+"snippet": "Article biomedical",
+"url": "https://pubmed.ncbi.nlm.nih.gov/" + pid + "/",
+"source": "PubMed",
+"score": 70,
+})
+elif name == "npm":
+data = json.loads(body)
+for obj in data.get("objects", [])[:5]:
+pkg = obj.get("package", {})
+out.append({
+"title": pkg.get("name", ""),
+"snippet": (pkg.get("description") or "")[:200],
+"url": pkg.get("links", {}).get("npm", ""),
+"source": "npm",
+"score": 60,
+})
+elif name == "pypi":
+data = json.loads(body)
+info = data.get("info", {})
+if info:
+out.append({
+"title": info.get("name", ""),
+"snippet": (info.get("summary") or "")[:300],
+"url": info.get("project_url", ""),
+"source": "PyPI",
+"score": 60,
+})
+elif name == "mdn":
+data = json.loads(body)
+for doc in data.get("documents", [])[:5]:
+out.append({
+"title": doc.get("title", ""),
+"snippet": (doc.get("summary") or "")[:300],
+"url": "https://developer.mozilla.org" + doc.get("mdn_url", ""),
+"source": "MDN",
+"score": 78,
+})
+elif name == "huggingface":
+data = json.loads(body)
+for item in data[:8] if isinstance(data, list) else []:
+out.append({
+"title": item.get("id", ""),
+"snippet": "Downloads " + str(item.get("downloads", 0)),
+"url": "https://huggingface.co/" + item.get("id", ""),
+"source": "HuggingFace",
+"score": 75,
+})
+elif name == "semanticscholar":
+data = json.loads(body)
+for p in data.get("data", [])[:5]:
+out.append({
+"title": p.get("title", ""),
+"snippet": (p.get("abstract") or "")[:300],
+"url": p.get("url", ""),
+"source": "SemanticScholar",
+"score": 78,
+})
+elif name == "coingecko":
+data = json.loads(body)
+for item in data.get("coins", [])[:5]:
+out.append({
+"title": item.get("name", ""),
+"snippet": item.get("symbol", "").upper(),
+"url": "https://www.coingecko.com/",
+"source": "CoinGecko",
+"score": 55,
+})
+elif name == "restcountries":
+data = json.loads(body)
+for c in data[:5] if isinstance(data, list) else []:
+out.append({
+"title": c.get("name", {}).get("common", ""),
+"snippet": "Capital {}".format((c.get("capital") or [""])[0]),
+"url": "https://restcountries.com/",
+"source": "RestCountries",
+"score": 55,
+})
+except Exception:
+pass
+return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 8 · HTML UI (Perplexity-like)
+# ═══════════════════════════════════════════════════════════════════════════
+
+HTML = r"""<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#000">
+<title>HYPERION PERPLEXITY v__V__</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{background:#0a0a14;color:#fff;font-family:-apple-system,BlinkMacSystemFont,"SF Pro","Inter",system-ui,sans-serif;min-height:100vh;
+background-image:
+radial-gradient(ellipse at 20% 20%, rgba(0,212,255,0.15) 0%, transparent 50%),
+radial-gradient(ellipse at 80% 80%, rgba(168,85,247,0.15) 0%, transparent 50%)}
+.wrap{max-width:900px;margin:0 auto;padding:24px 20px 80px}
+.logo{text-align:center;margin:30px 0 28px}
+.logo h1{font-size:48px;font-weight:800;letter-spacing:-3px;
+background:linear-gradient(90deg,#fff,#00d4ff,#a855f7,#ff6ec7);
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.logo p{color:#666;font-size:10px;letter-spacing:4px;margin-top:8px;text-transform:uppercase}
+.searchbox{position:relative;margin-bottom:20px}
+.searchbox input{width:100%;padding:18px 60px 18px 24px;background:rgba(20,20,30,0.8);
+border:1px solid rgba(255,255,255,0.1);color:#fff;border-radius:40px;
+font-size:16px;outline:none;font-family:inherit}
+.searchbox input:focus{border-color:#00d4ff;box-shadow:0 0 40px rgba(0,212,255,0.3)}
+.searchbox button{position:absolute;right:6px;top:50%;transform:translateY(-50%);
+width:46px;height:46px;border-radius:50%;border:none;
+background:linear-gradient(135deg,#00d4ff,#a855f7);color:#000;font-size:22px;cursor:pointer;font-weight:700}
+.answer{background:rgba(20,20,30,0.8);border:1px solid rgba(0,212,255,0.3);
+border-radius:16px;padding:24px;margin-bottom:20px;line-height:1.7}
+.answer h2{color:#00d4ff;font-size:12px;letter-spacing:2px;text-transform:uppercase;margin-bottom:14px}
+.answer p{color:#ddd;font-size:15px;margin-bottom:12px;white-space:pre-wrap}
+.answer sup{color:#00d4ff;font-weight:700;font-size:12px;margin-left:2px}
+.citations{margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.1)}
+.citations h3{color:#888;font-size:11px;letter-spacing:2px;text-transform:uppercase;margin-bottom:10px}
+.citation{display:block;padding:8px 12px;background:rgba(0,0,0,0.4);border-radius:8px;margin-bottom:6px;
+text-decoration:none;color:#aaa;font-size:12px;transition:all 0.2s}
+.citation:hover{background:rgba(0,212,255,0.1);color:#00d4ff}
+.citation b{color:#fff;font-family:monospace;margin-right:8px}
+.stats{text-align:center;color:#666;font-size:11px;margin-bottom:20px;font-family:monospace}
+.stats b{color:#00d4ff}
+.results{display:flex;flex-direction:column;gap:12px}
+.result{background:rgba(20,20,30,0.6);border:1px solid rgba(255,255,255,0.08);
+border-radius:12px;padding:14px 16px;text-decoration:none;color:inherit;display:block;transition:all 0.2s}
+.result:hover{transform:translateY(-2px);border-color:rgba(0,212,255,0.4)}
+.result .src{display:inline-block;background:rgba(0,212,255,0.15);color:#00d4ff;
+padding:2px 8px;border-radius:10px;font-size:9px;letter-spacing:1px;text-transform:uppercase;font-weight:700;margin-bottom:6px}
+.result h3{font-size:15px;font-weight:600;color:#fff;margin-bottom:5px;line-height:1.35}
+.result p{color:#999;font-size:13px;line-height:1.5;margin-bottom:5px}
+.result .url{color:#555;font-size:10px;word-break:break-all;font-family:monospace}
+.score{float:right;color:#00d4ff;font-size:10px;font-weight:700;
+background:rgba(0,212,255,0.1);padding:2px 8px;border-radius:10px;font-family:monospace}
+.empty{text-align:center;padding:60px 20px;color:#444}
+.panel{background:rgba(20,20,30,0.5);border:1px solid rgba(255,255,255,0.08);border-radius:14px;padding:16px;margin-top:20px}
+.panel h2{font-size:11px;color:#888;letter-spacing:2px;text-transform:uppercase;margin-bottom:12px}
+.btn{padding:8px 14px;border-radius:8px;border:1px solid rgba(255,255,255,0.1);
+background:rgba(255,255,255,0.05);color:#fff;font-size:12px;cursor:pointer;font-family:monospace;margin-right:6px;margin-bottom:6px}
+.btn:hover{border-color:#00d4ff;color:#00d4ff}
+.btn.start{background:linear-gradient(135deg,#00ff9d,#00d4ff);color:#000;border:none;font-weight:700}
+.btn.stop{background:linear-gradient(135deg,#f87171,#ff1744);color:#fff;border:none;font-weight:700}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}
+.stat{background:rgba(0,0,0,0.4);border-radius:10px;padding:12px;text-align:center}
+.stat .n{font-size:22px;font-weight:800;color:#00d4ff;font-family:monospace}
+.stat .l{font-size:10px;color:#888;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+pre{background:rgba(0,0,0,0.5);padding:10px;border-radius:8px;color:#00ff9d;
+font-family:monospace;font-size:11px;max-height:200px;overflow-y:auto;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<div class="wrap">
+<div class="logo">
+<h1>HYPERION</h1>
+<p>Perplexity Engine · v__V__ · 1M sources target</p>
+</div>
+
+<div class="searchbox">
+<input id="q" type="text" placeholder="Pose ta question..." autocomplete="off" autofocus>
+<button onclick="doSearch()">→</button>
+</div>
+
+<div class="stats" id="stats"></div>
+<div id="answer-container"></div>
+<div class="results" id="results"></div>
+
+<div class="panel">
+<h2>Crawler 1M sources</h2>
+<div class="grid">
+<div class="stat"><div class="n" id="st-sources">0</div><div class="l">Sources</div></div>
+<div class="stat"><div class="n" id="st-terms">0</div><div class="l">Termes</div></div>
+<div class="stat"><div class="n" id="st-queue">0</div><div class="l">Queue</div></div>
+<div class="stat"><div class="n" id="st-rate">0</div><div class="l">Pages/min</div></div>
+<div class="stat"><div class="n" id="st-workers">0</div><div class="l">Workers</div></div>
+<div class="stat"><div class="n" id="st-dup">0</div><div class="l">Dups</div></div>
+</div>
+<div style="margin-top:12px">
+<button class="btn start" onclick="crawlStart()">START</button>
+<button class="btn stop" onclick="crawlStop()">STOP</button>
+<button class="btn" onclick="seedAll()">Seed 200 domaines</button>
+<button class="btn" onclick="seedWiki()">Seed 1000 Wikipedia</button>
+<button class="btn" onclick="crawlStatus()">Status</button>
+</div>
+<pre id="ix-out">pret</pre>
+</div>
+</div>
+
+<script>
+document.getElementById('q').addEventListener('keydown', e => {
+if (e.key === 'Enter') doSearch();
+});
+
+async function doSearch() {
+const q = document.getElementById('q').value.trim();
+if (!q) return;
+document.getElementById('answer-container').innerHTML = '<div class="empty">Recherche...</div>';
+document.getElementById('results').innerHTML = '';
+try {
+const r = await fetch('/api/search?q=' + encodeURIComponent(q));
+const d = await r.json();
+document.getElementById('stats').innerHTML =
+'<b>' + d.count + '</b> sources · ' +
+d.sources.length + ' APIs · ' +
+'<b>' + d.duration_ms + 'ms</b>';
+renderAnswer(d);
+renderResults(d);
+} catch(e) {
+document.getElementById('answer-container').innerHTML = '<div class="empty">Erreur : ' + e.message + '</div>';
+}
+}
+
+function renderAnswer(d) {
+if (!d.answer || !d.answer.answer) return;
+const a = d.answer;
+let html = '<div class="answer">';
+html += '<h2>Réponse synthétisée · ' + (a.nb_sources || 0) + ' sources</h2>';
+html += '<p>' + escapeHtml(a.answer).replace(/\[(\d+)\]/g, '<sup>[$1]</sup>') + '</p>';
+if (a.citations && a.citations.length) {
+html += '<div class="citations"><h3>Citations</h3>';
+a.citations.forEach(c => {
+html += '<a class="citation" href="' + escapeAttr(c.url) + '" target="_blank">' +
+'<b>[' + c.id + ']</b>' + escapeHtml(c.title || c.url) +
+' · ' + escapeHtml(c.domain) + '</a>';
+});
+html += '</div>';
+}
+html += '</div>';
+document.getElementById('answer-container').innerHTML = html;
+}
+
+function renderResults(d) {
+if (!d.results || d.results.length === 0) return;
+document.getElementById('results').innerHTML = d.results.map(r => `
+<a class="result" href="${escapeAttr(r.url)}" target="_blank" rel="noopener">
+<div class="score">${r.score_final}</div>
+<span class="src">${escapeHtml(r.source)}</span>
+<h3>${escapeHtml(r.title)}</h3>
+<p>${escapeHtml(r.snippet)}</p>
+<div class="url">${escapeHtml(r.url)}</div>
+</a>
+`).join('');
+}
+
+function escapeHtml(t) { const d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
+function escapeAttr(t) { return escapeHtml(t).replace(/"/g, '&quot;'); }
+
+async function post(p) { const r = await fetch(p, {method:'POST'}); return await r.json(); }
+async function get(p) { const r = await fetch(p); return await r.json(); }
+
+async function crawlStart() { document.getElementById('ix-out').textContent = JSON.stringify(await post('/api/crawler/start'), null, 2); }
+async function crawlStop() { document.getElementById('ix-out').textContent = JSON.stringify(await post('/api/crawler/stop'), null, 2); }
+async function seedAll() { document.getElementById('ix-out').textContent = JSON.stringify(await post('/api/seed/all'), null, 2); }
+async function seedWiki() { document.getElementById('ix-out').textContent = JSON.stringify(await post('/api/seed/wikipedia'), null, 2); }
+async function crawlStatus() { document.getElementById('ix-out').textContent = JSON.stringify(await get('/api/crawler/status'), null, 2); }
+
+async function refreshStats() {
+try {
+const d = await get('/api/stats');
+document.getElementById('st-sources').textContent = d.index.sources || 0;
+document.getElementById('st-terms').textContent = d.index.terms || 0;
+document.getElementById('st-queue').textContent = d.index.queue || 0;
+document.getElementById('st-rate').textContent = (d.crawler && d.crawler.rate_per_min) || 0;
+document.getElementById('st-workers').textContent = (d.crawler && d.crawler.workers) || 0;
+document.getElementById('st-dup').textContent = (d.crawler && d.crawler.pages_duplicate) || 0;
+} catch(e) {}
+}
+
+setTimeout(() => document.getElementById('q').focus(), 100);
+refreshStats();
+setInterval(refreshStats, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+def page_html():
+h = HTML
+h = h.replace("__V__", VERSION)
+return h
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 9 · HTTP HANDLER
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Handler(BaseHTTPRequestHandler):
+server_version = "HyperionPerplexity/" + VERSION
+protocol_version = "HTTP/1.1"
+
+def log_message(self, *a):
+pass
+
+def _send(self, code, body, ctype="text/html; charset=utf-8"):
+try:
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+self.send_header("Access-Control-Allow-Origin", "*")
+self.end_headers()
+self.wfile.write(body)
+except (BrokenPipeError, ConnectionResetError):
+pass
+
+def _json(self, code, obj):
+self._send(code, json.dumps(obj, ensure_ascii=False, default=str),
+"application/json; charset=utf-8")
+
+def do_GET(self):
+p = urllib.parse.urlparse(self.path)
+path = p.path
+qs = urllib.parse.parse_qs(p.query)
+
+if path in ("/", "/index.html"):
+return self._send(200, page_html())
+
+if path == "/api/search":
+q = (qs.get("q", [""])[0] or "").strip()
+if not q:
+return self._json(400, {"error": "missing q"})
+try:
+return self._json(200, search(q))
+except Exception as e:
+return self._json(500, {"error": str(e)[:200]})
+
+if path == "/api/stats":
+return self._json(200, {
+"index": IDX.stats(),
+"crawler": CRAWLER.status(),
+"cache": len(CACHE),
+"version": VERSION,
+"seeds": len(SEED_DOMAINS),
+"apis": len(TRANSIT_APIS),
+})
+
+if path == "/api/crawler/status":
+return self._json(200, CRAWLER.status())
+
+if path == "/api/sources":
+return self._json(200, {
+"seeds": SEED_DOMAINS,
+"apis": list(TRANSIT_APIS.keys()),
+"count_seeds": len(SEED_DOMAINS),
+"count_apis": len(TRANSIT_APIS),
+})
+
+if path == "/api/health":
+return self._json(200, {
+"engine": "HYPERION PERPLEXITY",
+"version": VERSION,
+"auteur": AUTEUR,
+"licence": LICENCE,
+"repo": GIT["repo"],
+"seeds_count": len(SEED_DOMAINS),
+"apis_count": len(TRANSIT_APIS),
+"index": IDX.stats(),
+})
+
+if path == "/api/recent":
+limit = int(qs.get("limit", ["20"])[0])
+return self._json(200, {"docs": IDX.recent(limit)})
+
+if path == "/metrics":
+st = IDX.stats()
+cr = CRAWLER.status()
+lines = [
+"# HELP hyperion_sources Total indexed sources",
+"# TYPE hyperion_sources gauge",
+"hyperion_sources " + str(st.get("sources", 0)),
+"# HELP hyperion_terms Total indexed terms",
+"# TYPE hyperion_terms gauge",
+"hyperion_terms " + str(st.get("terms", 0)),
+"# HELP hyperion_queue Queue size",
+"# TYPE hyperion_queue gauge",
+"hyperion_queue " + str(st.get("queue", 0)),
+"# HELP hyperion_crawl_indexed_total Pages indexed",
+"# TYPE hyperion_crawl_indexed_total counter",
+"hyperion_crawl_indexed_total " + str(cr.get("pages_indexed", 0)),
+"# HELP hyperion_crawl_failed_total Pages failed",
+"# TYPE hyperion_crawl_failed_total counter",
+"hyperion_crawl_failed_total " + str(cr.get("pages_failed", 0)),
+"# HELP hyperion_crawl_dup_total Duplicates avoided",
+"# TYPE hyperion_crawl_dup_total counter",
+"hyperion_crawl_dup_total " + str(cr.get("pages_duplicate", 0)),
+"# HELP hyperion_rate_pages_per_min Crawl rate",
+"# TYPE hyperion_rate_pages_per_min gauge",
+"hyperion_rate_pages_per_min " + str(cr.get("rate_per_min", 0)),
+"# HELP hyperion_workers Active crawl workers",
+"# TYPE hyperion_workers gauge",
+"hyperion_workers " + str(cr.get("workers", 0)),
+]
+return self._send(200, "\n".join(lines) + "\n", "text/plain; charset=utf-8")
+
+return self._json(404, {"error": "not found"})
+
+def do_POST(self):
+p = urllib.parse.urlparse(self.path)
+path = p.path
+
+if path == "/api/crawler/start":
+ok = CRAWLER.start()
+return self._json(200, {"started": ok, "workers": CRAWLER.num_workers})
+
+if path == "/api/crawler/stop":
+CRAWLER.stop()
+return self._json(200, {"stopped": True})
+
+if path == "/api/seed/all":
+n = seed_all()
+return self._json(200, {"added": n, "total_domains": len(SEED_DOMAINS)})
+
+if path == "/api/seed/wikipedia":
+n = seed_wikipedia_random(1000)
+return self._json(200, {"added": n})
+
+return self._json(404, {"error": "not found"})
+
+
+class Server(ThreadingHTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION 10 · MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+
+def ip_locale():
+try:
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+ip = s.getsockname()[0]
+s.close()
+return ip
+except Exception:
+return "localhost"
+
+
+def main():
+print("")
+print("=" * 74)
+print(" HYPERION PERPLEXITY ENGINE v" + VERSION)
+print(" Auteur : " + AUTEUR + " | Licence : " + LICENCE)
+print("=" * 74)
+print("")
+print(" Moteur type Perplexity : question -> reponse citee + index massif")
+print("")
+print(" Seeds : " + str(len(SEED_DOMAINS)) + " domaines")
+print(" APIs : " + str(len(TRANSIT_APIS)) + " APIs de transit")
+print(" Crawler : " + str(CRAWLER.num_workers) + " workers")
+print(" Objectif : 1 000 000 sources")
+print("")
+print(" Local : http://localhost:" + str(PORT) + "/")
+print(" Reseau : http://" + ip_locale() + ":" + str(PORT) + "/")
+print(" API : http://localhost:" + str(PORT) + "/api/search?q=test")
+print(" Health : http://localhost:" + str(PORT) + "/api/health")
+print(" Stats : http://localhost:" + str(PORT) + "/api/stats")
+print(" Metrics: http://localhost:" + str(PORT) + "/metrics")
+print("")
+print(" DB : " + DB_FILE)
+print(" Cache : " + str(CACHE_MAX) + " entrees · TTL " + str(CACHE_TTL) + "s")
+print("")
+print(" Ctrl+C pour arreter")
+print("")
+
+log("=== HYPERION PERPLEXITY v" + VERSION + " ===")
+
+# Auto-seed au démarrage
+try:
+n = seed_all()
+log("Seeds auto : " + str(n) + " domaines")
+except Exception as e:
+log("seed err : " + str(e)[:120])
+
+# Auto-start crawler
+try:
+CRAWLER.start()
+log("Crawler demarre auto : " + str(CRAWLER.num_workers) + " workers")
+except Exception as e:
+log("crawler err : " + str(e)[:120])
+
+try:
+with Server((HOST, PORT), Handler) as httpd:
+log("Serveur pret : http://" + HOST + ":" + str(PORT))
+httpd.serve_forever()
+except KeyboardInterrupt:
+print("")
+print(" Arrete.")
+try:
+CRAWLER.stop()
+except Exception:
+pass
+print("")
+except OSError as e:
+print("")
+print(" Erreur port " + str(PORT) + " : " + str(e))
+print("")
+
+
+if __name__ == "__main__":
+main()
